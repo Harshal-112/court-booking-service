@@ -1,18 +1,18 @@
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
+from decimal import Decimal
 
-from sqlalchemy import and_, func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models import Court, CourtReservation, Member
+from app.models import Court, CourtReservation, Member, Venue
 
 
 HOLD_DURATION = timedelta(minutes=5)
 SLOT_DURATION = timedelta(hours=1)
 MAX_ACTIVE_RESERVATIONS = 3
-PEAK_START = time(18, 0)
-PEAK_END = time(22, 0)
+MAX_RECURRING_WEEKS = 12
 
 class ReservationError(Exception):
     """Base exception for reservation-related errors."""
@@ -48,6 +48,146 @@ class BookingNotFoundError(ReservationError):
 
 class BookingCancellationError(ReservationError):
     pass
+
+def calculate_booking_price(
+    venue,
+    starts_at: datetime,
+) -> Decimal:
+    """Calculate booking price using venue-local peak hours."""
+
+    venue_timezone = ZoneInfo(venue.timezone)
+    local_start = starts_at.astimezone(venue_timezone)
+    booking_time = local_start.timetz().replace(tzinfo=None)
+
+    peak_start = time.fromisoformat(venue.peak_start_time)
+    peak_end = time.fromisoformat(venue.peak_end_time)
+
+    if peak_start <= booking_time < peak_end:
+        return venue.peak_price
+
+    return venue.base_price
+
+def create_recurring_bookings(
+    session: Session,
+    member_id: int,
+    court_id: int,
+    starts_at: datetime,
+    weeks: int,
+) -> list[CourtReservation]:
+    """Create weekly recurring bookings atomically."""
+
+    now = datetime.now(timezone.utc)
+
+    if starts_at.tzinfo is None or starts_at.utcoffset() is None:
+        raise InvalidBookingTimeError(
+            "Booking time must include a timezone."
+        )
+
+    if starts_at <= now:
+        raise InvalidBookingTimeError(
+            "Booking must start in the future."
+        )
+
+    if not 1 <= weeks <= MAX_RECURRING_WEEKS:
+        raise InvalidBookingTimeError(
+            "Recurring bookings must be between 1 and 12 weeks."
+        )
+
+    reservations = []
+
+    try:
+        with session.begin():
+            member = session.scalar(
+                select(Member)
+                .where(Member.id == member_id)
+                .with_for_update()
+            )
+
+            if member is None:
+                raise MemberNotFoundError("Member not found.")
+
+            court = session.scalar(
+                select(Court)
+                .where(Court.id == court_id)
+                .with_for_update()
+            )
+
+            if court is None:
+                raise CourtNotFoundError("Court not found.")
+
+            venue = court.venue
+
+            venue_timezone = ZoneInfo(venue.timezone)
+            local_start = starts_at.astimezone(venue_timezone)
+
+
+            session.execute(
+                update(CourtReservation)
+                .where(
+                    CourtReservation.court_id == court_id,
+                    CourtReservation.status == "held",
+                    CourtReservation.expires_at <= now,
+                )
+                .values(status="expired")
+            )
+
+            active_count = session.scalar(
+                select(func.count(CourtReservation.id)).where(
+                    CourtReservation.member_id == member_id,
+                    CourtReservation.starts_at > now,
+                    or_(
+                        CourtReservation.status == "confirmed",
+                        and_(
+                            CourtReservation.status == "held",
+                            CourtReservation.expires_at > now,
+                        ),
+                    ),
+                )
+            ) or 0
+
+            if active_count + weeks > MAX_ACTIVE_RESERVATIONS:
+                raise BookingConflictError(
+                    "Recurring bookings exceed the maximum of 3 active future reservations."
+                )
+
+            for week in range(weeks):
+                local_occurrence = local_start + timedelta(weeks=week)
+                occurrence = local_occurrence.astimezone(timezone.utc)
+
+                if occurrence <= now:
+                    raise InvalidBookingTimeError(
+                        "All recurring booking dates must be in the future."
+                    )
+
+                price = calculate_booking_price(
+                    venue,
+                    occurrence,
+                )
+
+                reservation = CourtReservation(
+                    member_id=member_id,
+                    court_id=court_id,
+                    starts_at=occurrence,
+                    ends_at=occurrence + SLOT_DURATION,
+                    expires_at=None,
+                    status="confirmed",
+                    price=price,
+                )
+
+                session.add(reservation)
+                reservations.append(reservation)
+
+            session.flush()
+
+    except IntegrityError as exc:
+        if getattr(exc.orig, "sqlstate", None) == "23P01":
+            raise BookingConflictError(
+                "At least one recurring slot is already reserved. No bookings were created."
+            ) from exc
+
+        raise
+
+    return reservations
 
 def create_hold(
     session: Session,
@@ -89,18 +229,13 @@ def create_hold(
             )
             if court is None:
                 raise CourtNotFoundError("Court not found.")
-            
+
             venue = court.venue
 
-            venue_timezone = ZoneInfo(venue.timezone)
-            local_start = starts_at.astimezone(venue_timezone)
-
-            booking_time = local_start.timetz().replace(tzinfo=None)
-
-            if PEAK_START <= booking_time < PEAK_END:
-                booking_price = venue.peak_price
-            else:
-                booking_price = venue.base_price
+            booking_price = calculate_booking_price(
+                venue,
+                starts_at,
+            )
 
             # Release expired holds for this court.
             session.execute(
@@ -326,3 +461,137 @@ def get_court_availability(
                 break
 
     return slots
+
+
+def get_weekly_utilization(
+    session: Session,
+    venue_id: int,
+    week_start: date,
+) -> dict:
+    """Calculate weekly utilization for every court in a venue."""
+
+    venue = session.scalar(
+        select(Venue).where(Venue.id == venue_id)
+    )
+
+    if venue is None:
+        raise ReservationError("Venue not found.")
+
+    venue_timezone = ZoneInfo(venue.timezone)
+
+    week_start_date = week_start - timedelta(
+        days=week_start.weekday()
+    )
+    week_end_date = week_start_date + timedelta(days=7)
+
+    opening_time = time.fromisoformat(venue.opening_time)
+    closing_time = time.fromisoformat(venue.closing_time)
+
+    daily_operating_minutes = (
+        closing_time.hour * 60 + closing_time.minute
+        - opening_time.hour * 60 - opening_time.minute
+    )
+
+    total_weekly_hours = Decimal(
+        str(daily_operating_minutes * 7)
+    ) / Decimal("60")
+
+    courts = session.scalars(
+        select(Court)
+        .where(Court.venue_id == venue_id)
+        .order_by(Court.id)
+    ).all()
+
+    report = []
+
+    now = datetime.now(timezone.utc)
+
+    for court in courts:
+        confirmed_hours = Decimal("0")
+        active_hold_hours = Decimal("0")
+        booking_count = 0
+
+        for day_offset in range(7):
+            current_date = week_start_date + timedelta(
+                days=day_offset
+            )
+
+            operating_start = datetime.combine(
+                current_date,
+                opening_time,
+                tzinfo=venue_timezone,
+            ).astimezone(timezone.utc)
+
+            operating_end = datetime.combine(
+                current_date,
+                closing_time,
+                tzinfo=venue_timezone,
+            ).astimezone(timezone.utc)
+
+            reservations = session.scalars(
+                select(CourtReservation).where(
+                    CourtReservation.court_id == court.id,
+                    CourtReservation.starts_at < operating_end,
+                    CourtReservation.ends_at > operating_start,
+                    or_(
+                        CourtReservation.status == "confirmed",
+                        and_(
+                            CourtReservation.status == "held",
+                            CourtReservation.expires_at > now,
+                        ),
+                    ),
+                )
+            ).all()
+
+            for reservation in reservations:
+                overlap_start = max(
+                    reservation.starts_at,
+                    operating_start,
+                )
+
+                overlap_end = min(
+                    reservation.ends_at,
+                    operating_end,
+                )
+
+                overlap_seconds = (
+                    overlap_end - overlap_start
+                ).total_seconds()
+
+                overlap_hours = (
+                    Decimal(str(overlap_seconds))
+                    / Decimal("3600")
+                )
+
+                if reservation.status == "confirmed":
+                    confirmed_hours += overlap_hours
+                    booking_count += 1
+
+                elif reservation.status == "held":
+                    active_hold_hours += overlap_hours
+
+        utilization = (
+            confirmed_hours / total_weekly_hours * 100
+            if total_weekly_hours > 0
+            else Decimal("0")
+        )
+
+        report.append({
+            "court_id": court.id,
+            "court_name": court.name,
+            "total_operating_hours": total_weekly_hours,
+            "confirmed_booking_hours": confirmed_hours,
+            "active_hold_hours": active_hold_hours,
+            "utilization_percentage": utilization.quantize(
+                Decimal("0.01")
+            ),
+            "booking_count": booking_count,
+        })
+
+    return {
+        "venue_id": venue.id,
+        "venue_name": venue.name,
+        "week_start": week_start_date,
+        "week_end": week_end_date - timedelta(days=1),
+        "courts": report,
+    }

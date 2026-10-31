@@ -332,3 +332,108 @@ def test_court_availability_api_invalid_court():
 
     assert response.status_code == 404
     assert response.json()["detail"] == "Court not found."
+
+def test_create_recurring_bookings_api():
+    # Arrange: Create member, venue and court.
+    with SessionLocal() as session:
+        member = Member(
+            email=f"recurring_api_{uuid4().hex[:8]}@example.com",
+            full_name="Recurring API Test Member",
+        )
+
+        venue = Venue(
+            name="Recurring API Venue",
+            timezone="Asia/Kolkata",
+            address="Test Address",
+        )
+
+        session.add_all([member, venue])
+        session.flush()
+
+        court = Court(
+            venue_id=venue.id,
+            name="Recurring API Court",
+            sport_type="Badminton",
+        )
+
+        session.add(court)
+        session.commit()
+
+        member_id = member.id
+        court_id = court.id
+
+    # Act: Create three weekly bookings through the API.
+    client = TestClient(app)
+
+    starts_at = (
+        datetime.now(timezone.utc) + timedelta(days=2)
+    ).replace(minute=0, second=0, microsecond=0)
+
+    response = client.post(
+        "/recurring-bookings",
+        json={
+            "member_id": member_id,
+            "court_id": court_id,
+            "starts_at": starts_at.isoformat(),
+            "weeks": 3,
+        },
+    )
+
+    # Assert.
+    assert response.status_code == 201
+
+    data = response.json()
+
+    assert len(data) == 3
+    assert all(item["status"] == "confirmed" for item in data)
+    assert all(item["expires_at"] is None for item in data)
+
+def test_recurring_bookings_api_rejects_member_limit():
+    with SessionLocal() as session:
+        member = Member(
+            email=f"recurring_limit_{uuid4().hex[:8]}@example.com",
+            full_name="Recurring Limit Test Member",
+        )
+
+        venue = Venue(
+            name="Recurring Limit Venue",
+            timezone="Asia/Kolkata",
+            address="Test Address",
+        )
+
+        session.add_all([member, venue])
+        session.flush()
+
+        court = Court(
+            venue_id=venue.id,
+            name="Recurring Limit Court",
+            sport_type="Badminton",
+        )
+
+        session.add(court)
+        session.commit()
+
+        member_id = member.id
+        court_id = court.id
+
+    starts_at = (
+        datetime.now(timezone.utc) + timedelta(days=2)
+    ).replace(minute=0, second=0, microsecond=0)
+
+    client = TestClient(app)
+
+    response = client.post(
+        "/recurring-bookings",
+        json={
+            "member_id": member_id,
+            "court_id": court_id,
+            "starts_at": starts_at.isoformat(),
+            "weeks": 4,
+        },
+    )
+
+    assert response.status_code == 409
+
+    assert response.json()["detail"] == (
+        "Recurring bookings exceed the maximum of 3 active future reservations."
+    )

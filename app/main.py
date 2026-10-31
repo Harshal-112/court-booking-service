@@ -4,7 +4,13 @@ from sqlalchemy.orm import Session
 from datetime import date
 
 from app.database import SessionLocal
-from app.schema import HoldCreateRequest, HoldResponse, CourtAvailabilityResponse
+from app.schema import (
+    HoldCreateRequest,
+    HoldResponse,
+    CourtAvailabilityResponse,
+    RecurringBookingRequest,
+    WeeklyUtilizationResponse,
+)
 from app.services.reservation_service import (
     create_hold,
     MemberNotFoundError,
@@ -18,7 +24,10 @@ from app.services.reservation_service import (
     BookingNotFoundError,
     BookingCancellationError,
     get_court_availability,
-    )
+    create_recurring_bookings,
+    get_weekly_utilization,
+    ReservationError,
+)
 
 
 app = FastAPI(
@@ -168,5 +177,77 @@ def court_availability_endpoint(
     except CourtNotFoundError as exc:
         raise HTTPException(
             status_code=404,
+            detail=str(exc),
+        )
+
+@app.post(
+    "/recurring-bookings",
+    response_model=list[HoldResponse],
+    status_code=status.HTTP_201_CREATED,
+)
+def create_recurring_bookings_endpoint(
+    request: RecurringBookingRequest,
+    db: Session = Depends(get_db),
+):
+    try:
+        reservations = create_recurring_bookings(
+            session=db,
+            member_id=request.member_id,
+            court_id=request.court_id,
+            starts_at=request.starts_at,
+            weeks=request.weeks,
+        )
+
+        return reservations
+
+    except MemberNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        )
+
+    except CourtNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=str(exc),
+        )
+
+    except BookingConflictError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail=str(exc),
+        )
+
+    except InvalidBookingTimeError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        )
+
+@app.get(
+    "/venues/{venue_id}/utilization/weekly",
+    response_model=WeeklyUtilizationResponse,
+)
+def weekly_venue_utilization(
+    venue_id: int,
+    week_start: date,
+    session: Session = Depends(get_db),
+):
+    try:
+        return get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+    except ReservationError as exc:
+        if str(exc) == "Venue not found.":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=str(exc),
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         )

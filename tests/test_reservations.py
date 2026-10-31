@@ -5,6 +5,7 @@ from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from zoneinfo import ZoneInfo
+from app.services.reservation_service import get_weekly_utilization
 
 from app.services.reservation_service import InvalidBookingTimeError
 from app.database import SessionLocal
@@ -16,6 +17,7 @@ from app.services.reservation_service import (
     confirm_hold,
     HoldNotFoundError,
     HoldExpiredError,
+    create_recurring_bookings,
 )
 
 from app.services.reservation_service import cancel_booking
@@ -1254,7 +1256,10 @@ def test_peak_booking_uses_peak_price(db_session, test_member, test_court):
 
     assert reservation.price == Decimal("750.00")
 
-def create_pricing_test_data():
+def create_pricing_test_data(
+    peak_start_time="18:00",
+    peak_end_time="22:00",
+):
     with SessionLocal() as session:
         member = Member(
             email=f"pricing_{uuid4().hex[:8]}@example.com",
@@ -1267,6 +1272,8 @@ def create_pricing_test_data():
             address="Test Address",
             base_price=500.00,
             peak_price=750.00,
+            peak_start_time=peak_start_time,
+            peak_end_time=peak_end_time,
         )
 
         session.add_all([member, venue])
@@ -1282,6 +1289,28 @@ def create_pricing_test_data():
         session.commit()
 
         return member.id, court.id
+
+def test_custom_peak_hours_use_peak_price():
+    member_id, court_id = create_pricing_test_data(
+        peak_start_time="14:00",
+        peak_end_time="18:00",
+    )
+
+    local_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata"))
+        .replace(hour=16, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    )
+
+    with SessionLocal() as session:
+        reservation = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=local_start,
+        )
+
+        assert reservation.price == Decimal("750.00")
 
 
 def test_off_peak_booking_uses_base_price():
@@ -1359,3 +1388,471 @@ def test_price_remains_unchanged_after_confirmation():
 
         assert confirmed.status == "confirmed"
         assert confirmed.price == Decimal("750.00")
+
+def test_booking_at_peak_end_uses_base_price():
+    member_id, court_id = create_pricing_test_data(
+        peak_start_time="14:00",
+        peak_end_time="18:00",
+    )
+
+    local_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata"))
+        .replace(hour=18, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    )
+
+    with SessionLocal() as session:
+        reservation = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=local_start,
+        )
+
+        assert reservation.price == Decimal("500.00")
+
+def test_booking_at_peak_start_uses_peak_price():
+    member_id, court_id = create_pricing_test_data(
+        peak_start_time="14:00",
+        peak_end_time="18:00",
+    )
+
+    local_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata"))
+        .replace(hour=14, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    )
+
+    with SessionLocal() as session:
+        reservation = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=local_start,
+        )
+
+        assert reservation.price == Decimal("750.00")
+
+def test_peak_pricing_uses_venue_timezone():
+    member_id, court_id = create_pricing_test_data(
+        peak_start_time="14:00",
+        peak_end_time="18:00",
+    )
+
+    local_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata"))
+        .replace(hour=16, minute=0, second=0, microsecond=0)
+        + timedelta(days=1)
+    )
+
+    utc_start = local_start.astimezone(ZoneInfo("UTC"))
+
+    with SessionLocal() as session:
+        reservation = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=utc_start,
+        )
+
+        assert reservation.price == Decimal("750.00")
+
+def test_create_recurring_bookings_success():
+    member_id, court_id = create_pricing_test_data()
+
+    starts_at = (
+        datetime.now(timezone.utc)
+        .replace(minute=0, second=0, microsecond=0)
+        + timedelta(days=2)
+    )
+
+    with SessionLocal() as session:
+        reservations = create_recurring_bookings(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=starts_at,
+            weeks=3,
+        )
+
+        assert len(reservations) == 3
+
+        assert all(
+            reservation.status == "confirmed"
+            for reservation in reservations
+        )
+
+        assert reservations[0].starts_at == starts_at
+        assert reservations[1].starts_at == starts_at + timedelta(weeks=1)
+        assert reservations[2].starts_at == starts_at + timedelta(weeks=2)
+
+        for reservation in reservations:
+            local_time = reservation.starts_at.astimezone(
+                ZoneInfo("Asia/Kolkata")
+            )
+
+            expected_local_time = starts_at.astimezone(
+                ZoneInfo("Asia/Kolkata")
+            )
+
+            assert local_time.weekday() == expected_local_time.weekday()
+            assert local_time.time() == expected_local_time.time()
+
+        assert all(
+            reservation.expires_at is None
+            for reservation in reservations
+        )
+
+def test_recurring_bookings_rollback_if_one_slot_is_unavailable():
+    member_id, court_id = create_pricing_test_data()
+
+    starts_at = (
+        datetime.now(timezone.utc)
+        .replace(minute=0, second=0, microsecond=0)
+        + timedelta(days=2)
+    )
+
+    occupied_slot = starts_at + timedelta(weeks=1)
+
+    # Another member already occupies the second weekly slot.
+    other_member_id, _ = create_pricing_test_data()
+
+    with SessionLocal() as session:
+        create_hold(
+            session=session,
+            member_id=other_member_id,
+            court_id=court_id,
+            starts_at=occupied_slot,
+        )
+
+    with SessionLocal() as session:
+        with pytest.raises(BookingConflictError):
+            create_recurring_bookings(
+                session=session,
+                member_id=member_id,
+                court_id=court_id,
+                starts_at=starts_at,
+                weeks=3,
+            )
+
+    # Verify that the first and third occurrences were not inserted.
+    with SessionLocal() as session:
+        reservations = session.scalars(
+            select(CourtReservation).where(
+                CourtReservation.member_id == member_id,
+                CourtReservation.court_id == court_id,
+            )
+        ).all()
+
+        assert len(reservations) == 0
+
+def test_weekly_utilization_returns_court_data():
+    member_id, court_id = create_pricing_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=1,
+            week_start=week_start,
+        )
+
+        assert "courts" in report
+
+def create_utilization_test_data():
+    with SessionLocal() as session:
+        member = Member(
+            email=f"utilization_{uuid4().hex[:8]}@example.com",
+            full_name="Utilization Test Member",
+        )
+
+        venue = Venue(
+            name="Utilization Test Venue",
+            timezone="Asia/Kolkata",
+            address="Test Address",
+            opening_time="06:00",
+            closing_time="22:00",
+        )
+
+        session.add_all([member, venue])
+        session.flush()
+
+        court = Court(
+            venue_id=venue.id,
+            name="Utilization Test Court",
+            sport_type="Badminton",
+        )
+
+        session.add(court)
+        session.commit()
+
+        return member.id, venue.id, court.id
+
+def test_weekly_utilization_returns_court_data():
+    member_id, venue_id, court_id = create_utilization_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+        assert report["venue_id"] == venue_id
+        assert report["week_start"].weekday() == 0
+        assert len(report["courts"]) == 1
+
+        court_report = report["courts"][0]
+
+        assert court_report["court_id"] == court_id
+        assert court_report["court_name"] == "Utilization Test Court"
+        assert court_report["total_operating_hours"] == Decimal("112.0")
+        assert court_report["confirmed_booking_hours"] == Decimal("0")
+        assert court_report["active_hold_hours"] == Decimal("0")
+        assert court_report["utilization_percentage"] == Decimal("0.00")
+        assert court_report["booking_count"] == 0
+
+def test_weekly_utilization_counts_confirmed_booking():
+    member_id, court_id = create_pricing_test_data()
+
+    venue_id, _ = create_utilization_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    monday = week_start - timedelta(days=week_start.weekday())
+
+    starts_at = datetime(
+        monday.year,
+        monday.month,
+        monday.day,
+        10,
+        0,
+        tzinfo=ZoneInfo("Asia/Kolkata"),
+    )
+
+    with SessionLocal() as session:
+        hold = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=starts_at,
+        )
+
+        confirm_hold(
+            session=session,
+            hold_id=hold.id,
+        )
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+        court_report = report["courts"][0]
+
+        assert court_report["confirmed_booking_hours"] == Decimal("1.0")
+        assert court_report["active_hold_hours"] == Decimal("0")
+        assert court_report["booking_count"] == 1
+
+def test_weekly_utilization_counts_confirmed_booking():
+    member_id, venue_id, court_id = create_utilization_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    monday = week_start - timedelta(days=week_start.weekday())
+
+    starts_at = datetime(
+        monday.year,
+        monday.month,
+        monday.day,
+        10,
+        0,
+        tzinfo=ZoneInfo("Asia/Kolkata"),
+    )
+
+    with SessionLocal() as session:
+        hold = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=starts_at,
+        )
+
+        confirm_hold(
+            session=session,
+            hold_id=hold.id,
+        )
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+        court_report = report["courts"][0]
+
+        assert court_report["confirmed_booking_hours"] == Decimal("1.0")
+        assert court_report["active_hold_hours"] == Decimal("0")
+        assert court_report["booking_count"] == 1
+
+def test_weekly_utilization_counts_active_hold():
+    member_id, venue_id, court_id = create_utilization_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    monday = week_start - timedelta(days=week_start.weekday())
+
+    starts_at = datetime(
+        monday.year,
+        monday.month,
+        monday.day,
+        11,
+        0,
+        tzinfo=ZoneInfo("Asia/Kolkata"),
+    )
+
+    with SessionLocal() as session:
+        create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=starts_at,
+        )
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+        court_report = report["courts"][0]
+
+        assert court_report["confirmed_booking_hours"] == Decimal("0")
+        assert court_report["active_hold_hours"] == Decimal("1.0")
+        assert court_report["booking_count"] == 0
+
+def test_weekly_utilization_counts_only_operating_hours_overlap():
+    member_id, venue_id, court_id = create_utilization_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    monday = week_start - timedelta(days=week_start.weekday())
+
+    starts_at = datetime(
+        monday.year,
+        monday.month,
+        monday.day,
+        5,
+        30,
+        tzinfo=ZoneInfo("Asia/Kolkata"),
+    )
+
+    with SessionLocal() as session:
+        hold = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=starts_at,
+        )
+
+        confirm_hold(session=session, hold_id=hold.id)
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+        court_report = report["courts"][0]
+
+        assert court_report["confirmed_booking_hours"] == Decimal("0.5")
+        assert court_report["booking_count"] == 1
+
+def test_weekly_utilization_excludes_cancelled_booking():
+    member_id, venue_id, court_id = create_utilization_test_data()
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    monday = week_start - timedelta(days=week_start.weekday())
+
+    starts_at = datetime(
+        monday.year,
+        monday.month,
+        monday.day,
+        10,
+        0,
+        tzinfo=ZoneInfo("Asia/Kolkata"),
+    )
+
+    with SessionLocal() as session:
+        hold = create_hold(
+            session=session,
+            member_id=member_id,
+            court_id=court_id,
+            starts_at=starts_at,
+        )
+
+        confirm_hold(session=session, hold_id=hold.id)
+
+        cancel_booking(
+            session=session,
+            booking_id=hold.id,
+        )
+
+    with SessionLocal() as session:
+        report = get_weekly_utilization(
+            session=session,
+            venue_id=venue_id,
+            week_start=week_start,
+        )
+
+        court_report = report["courts"][0]
+
+        assert court_report["confirmed_booking_hours"] == Decimal("0")
+        assert court_report["active_hold_hours"] == Decimal("0")
+        assert court_report["booking_count"] == 0
+
+def test_weekly_utilization_raises_error_for_invalid_venue():
+    from app.services.reservation_service import ReservationError
+
+    week_start = (
+        datetime.now(ZoneInfo("Asia/Kolkata")).date()
+        + timedelta(days=7)
+    )
+
+    with SessionLocal() as session:
+        with pytest.raises(ReservationError, match="Venue not found"):
+            get_weekly_utilization(
+                session=session,
+                venue_id=999999,
+                week_start=week_start,
+            )
