@@ -36,6 +36,7 @@ def test_create_hold_success():
         member = Member(
             email=f"test_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -83,6 +84,7 @@ def test_prevent_double_booking():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -124,6 +126,7 @@ def test_member_cannot_create_more_than_three_active_reservations():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -178,6 +181,7 @@ def test_reject_past_booking_time():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -216,6 +220,7 @@ def test_reject_booking_without_timezone():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -254,6 +259,7 @@ def test_expired_hold_does_not_block_slot():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -312,6 +318,7 @@ def test_confirm_hold_success():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -344,7 +351,7 @@ def test_confirm_hold_success():
         hold_id = hold.id
 
     with SessionLocal() as session:
-        confirmed = confirm_hold(session, hold_id)
+        confirmed = confirm_hold(session, hold_id, member_id)
 
         assert confirmed.id == hold_id
         assert confirmed.status == "confirmed"
@@ -356,6 +363,7 @@ def test_confirm_hold_is_idempotent():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -387,11 +395,11 @@ def test_confirm_hold_is_idempotent():
 
     # First confirmation.
     with SessionLocal() as session:
-        first_result = confirm_hold(session, hold_id)
+        first_result = confirm_hold(session, hold_id, member_id)
 
     # Retry the same confirmation.
     with SessionLocal() as session:
-        second_result = confirm_hold(session, hold_id)
+        second_result = confirm_hold(session, hold_id, member_id)
 
     assert first_result.id == second_result.id
     assert first_result.status == "confirmed"
@@ -411,6 +419,7 @@ def test_cannot_confirm_expired_hold():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -449,7 +458,7 @@ def test_cannot_confirm_expired_hold():
     # Confirmation must fail.
     with SessionLocal() as session:
         try:
-            confirm_hold(session, hold_id)
+            confirm_hold(session, hold_id, member_id)
             assert False, "Expected HoldExpiredError"
         except HoldExpiredError:
             pass
@@ -463,7 +472,7 @@ def test_cannot_confirm_expired_hold():
 def test_confirm_nonexistent_hold():
     with SessionLocal() as session:
         try:
-            confirm_hold(session, 999999)
+            confirm_hold(session, 999999, 1)
             assert False, "Expected HoldNotFoundError"
         except HoldNotFoundError:
             pass
@@ -474,6 +483,7 @@ def test_concurrent_confirmation_is_idempotent():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -509,7 +519,7 @@ def test_concurrent_confirmation_is_idempotent():
     def confirm_from_separate_session():
         with SessionLocal() as session:
             barrier.wait(timeout=10)
-            result = confirm_hold(session, hold_id)
+            result = confirm_hold(session, hold_id, member_id)
             return result.id, result.status
 
     # Execute both requests concurrently.
@@ -537,6 +547,7 @@ def test_cancel_booking_with_full_refund_eligibility():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -569,11 +580,11 @@ def test_cancel_booking_with_full_refund_eligibility():
 
     # Confirm hold.
     with SessionLocal() as session:
-        confirm_hold(session, hold_id)
+        confirm_hold(session, hold_id, member_id)
 
     # Cancel booking.
     with SessionLocal() as session:
-        cancelled = cancel_booking(session, hold_id)
+        cancelled = cancel_booking(session, hold_id, member_id)
 
         assert cancelled.status == "cancelled"
         assert cancelled.cancelled_at is not None
@@ -585,6 +596,7 @@ def test_cancel_booking_without_full_refund_eligibility():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -615,10 +627,10 @@ def test_cancel_booking_without_full_refund_eligibility():
         hold_id = hold.id
 
     with SessionLocal() as session:
-        confirm_hold(session, hold_id)
+        confirm_hold(session, hold_id, member_id)
 
     with SessionLocal() as session:
-        cancelled = cancel_booking(session, hold_id)
+        cancelled = cancel_booking(session, hold_id, member_id)
 
         assert cancelled.status == "cancelled"
         assert cancelled.cancelled_at is not None
@@ -630,6 +642,7 @@ def test_cancel_booking_is_idempotent():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -660,16 +673,16 @@ def test_cancel_booking_is_idempotent():
         hold_id = hold.id
 
     with SessionLocal() as session:
-        confirm_hold(session, hold_id)
+        confirm_hold(session, hold_id, member_id)
 
     # First cancellation.
     with SessionLocal() as session:
-        first_result = cancel_booking(session, hold_id)
+        first_result = cancel_booking(session, hold_id, member_id)
         first_cancelled_at = first_result.cancelled_at
 
     # Retry cancellation.
     with SessionLocal() as session:
-        second_result = cancel_booking(session, hold_id)
+        second_result = cancel_booking(session, hold_id, member_id)
 
     assert second_result.status == "cancelled"
     assert second_result.cancelled_at == first_cancelled_at
@@ -681,11 +694,13 @@ def test_cancelled_slot_can_be_booked_by_another_member():
         member_one = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Member One",
+            password_hash="test-hash",
         )
 
         member_two = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Member Two",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -720,11 +735,11 @@ def test_cancelled_slot_can_be_booked_by_another_member():
         first_hold_id = first_hold.id
 
     with SessionLocal() as session:
-        confirm_hold(session, first_hold_id)
+        confirm_hold(session, first_hold_id, member_one_id)
 
     # First member cancels the booking.
     with SessionLocal() as session:
-        cancelled = cancel_booking(session, first_hold_id)
+        cancelled = cancel_booking(session, first_hold_id, member_one_id)
         assert cancelled.status == "cancelled"
 
     # Second member books the same slot.
@@ -741,7 +756,7 @@ def test_cancelled_slot_can_be_booked_by_another_member():
 def test_cancel_nonexistent_booking():
     with SessionLocal() as session:
         try:
-            cancel_booking(session, 999999)
+            cancel_booking(session, 999999, 1)
             assert False, "Expected BookingNotFoundError"
         except BookingNotFoundError:
             pass
@@ -752,6 +767,7 @@ def test_cannot_cancel_unconfirmed_hold():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -785,7 +801,7 @@ def test_cannot_cancel_unconfirmed_hold():
     # Cancellation must be rejected.
     with SessionLocal() as session:
         try:
-            cancel_booking(session, hold_id)
+            cancel_booking(session, hold_id, member_id)
             assert False, "Expected BookingCancellationError"
         except BookingCancellationError:
             pass
@@ -802,6 +818,7 @@ def test_concurrent_cancellation_is_idempotent():
         member = Member(
             email=f"member_{uuid4().hex[:8]}@example.com",
             full_name="Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -832,14 +849,14 @@ def test_concurrent_cancellation_is_idempotent():
         hold_id = hold.id
 
     with SessionLocal() as session:
-        confirm_hold(session, hold_id)
+        confirm_hold(session, hold_id, member_id)
 
     barrier = Barrier(2)
 
     def cancel_from_separate_session():
         with SessionLocal() as session:
             barrier.wait(timeout=10)
-            result = cancel_booking(session, hold_id)
+            result = cancel_booking(session, hold_id, member_id)
             return result.id, result.status, result.cancelled_at
 
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -864,6 +881,7 @@ def test_court_availability_returns_open_slots():
         member = Member(
             email="availability@example.com",
             full_name="Availability Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -911,6 +929,7 @@ def test_confirmed_booking_makes_slot_unavailable():
         member = Member(
             email="availability_confirmed@example.com",
             full_name="Availability Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -952,7 +971,7 @@ def test_confirmed_booking_makes_slot_unavailable():
         hold_id = hold.id
 
     with SessionLocal() as session:
-        confirm_hold(session, hold_id)
+        confirm_hold(session, hold_id, member_id)
 
     with SessionLocal() as session:
         slots = get_court_availability(
@@ -977,6 +996,7 @@ def test_active_hold_makes_slot_unavailable():
         member = Member(
             email="availability_hold@example.com",
             full_name="Availability Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -1039,6 +1059,7 @@ def test_expired_hold_does_not_make_slot_unavailable():
         member = Member(
             email="availability_expired@example.com",
             full_name="Availability Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -1110,6 +1131,7 @@ def test_cancelled_reservation_does_not_block_slot():
         member = Member(
             email="availability_cancelled@example.com",
             full_name="Availability Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -1151,10 +1173,10 @@ def test_cancelled_reservation_does_not_block_slot():
         hold_id = hold.id
 
     with SessionLocal() as session:
-        confirm_hold(session, hold_id)
+        confirm_hold(session, hold_id, member_id)
 
     with SessionLocal() as session:
-        cancel_booking(session, hold_id)
+        cancel_booking(session, hold_id, member_id)
 
     with SessionLocal() as session:
         slots = get_court_availability(
@@ -1264,6 +1286,7 @@ def create_pricing_test_data(
         member = Member(
             email=f"pricing_{uuid4().hex[:8]}@example.com",
             full_name="Pricing Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -1384,7 +1407,7 @@ def test_price_remains_unchanged_after_confirmation():
         session.commit()
 
     with SessionLocal() as session:
-        confirmed = confirm_hold(session, reservation_id)
+        confirmed = confirm_hold(session, reservation_id, member_id)
 
         assert confirmed.status == "confirmed"
         assert confirmed.price == Decimal("750.00")
@@ -1568,6 +1591,7 @@ def create_utilization_test_data():
         member = Member(
             email=f"utilization_{uuid4().hex[:8]}@example.com",
             full_name="Utilization Test Member",
+            password_hash="test-hash",
         )
 
         venue = Venue(
@@ -1653,6 +1677,7 @@ def test_weekly_utilization_counts_confirmed_booking():
         confirm_hold(
             session=session,
             hold_id=hold.id,
+            member_id=member_id,
         )
 
     with SessionLocal() as session:
@@ -1698,6 +1723,7 @@ def test_weekly_utilization_counts_confirmed_booking():
         confirm_hold(
             session=session,
             hold_id=hold.id,
+            member_id=member_id,
         )
 
     with SessionLocal() as session:
@@ -1780,7 +1806,7 @@ def test_weekly_utilization_counts_only_operating_hours_overlap():
             starts_at=starts_at,
         )
 
-        confirm_hold(session=session, hold_id=hold.id)
+        confirm_hold(session=session, hold_id=hold.id, member_id=member_id)
 
     with SessionLocal() as session:
         report = get_weekly_utilization(
@@ -1821,11 +1847,12 @@ def test_weekly_utilization_excludes_cancelled_booking():
             starts_at=starts_at,
         )
 
-        confirm_hold(session=session, hold_id=hold.id)
+        confirm_hold(session=session, hold_id=hold.id, member_id=member_id)
 
         cancel_booking(
             session=session,
             booking_id=hold.id,
+            member_id=member_id,
         )
 
     with SessionLocal() as session:

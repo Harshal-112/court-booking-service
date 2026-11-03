@@ -18,7 +18,12 @@ from app.database import Base
 
 class Member(Base):
     __tablename__ = "members"
-
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('member', 'staff')",
+            name="ck_members_valid_role",
+        ),
+    )
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     email: Mapped[str] = mapped_column(
         String(255),
@@ -29,6 +34,17 @@ class Member(Base):
     full_name: Mapped[str] = mapped_column(
         String(150),
         nullable=False,
+    )
+    password_hash: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+    )
+
+    role: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="member",
+        server_default="member",
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

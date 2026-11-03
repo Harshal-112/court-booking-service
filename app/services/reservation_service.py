@@ -293,20 +293,22 @@ def create_hold(
     return reservation
 
 
-
 def confirm_hold(
     session: Session,
     hold_id: int,
+    member_id: int,
 ) -> CourtReservation:
     """Confirm an active hold."""
-
     now = datetime.now(timezone.utc)
     hold_expired = False
 
     with session.begin():
         reservation = session.scalar(
             select(CourtReservation)
-            .where(CourtReservation.id == hold_id)
+            .where(
+                CourtReservation.id == hold_id,
+                CourtReservation.member_id == member_id,
+            )
             .with_for_update()
         )
 
@@ -316,14 +318,11 @@ def confirm_hold(
         if reservation.status == "confirmed":
             # Retry of an already successful confirmation.
             pass
-
         elif reservation.status != "held":
             raise HoldExpiredError("Hold is no longer active.")
-
         elif reservation.expires_at is None or reservation.expires_at <= now:
             reservation.status = "expired"
             hold_expired = True
-
         else:
             reservation.status = "confirmed"
             reservation.expires_at = None
@@ -340,15 +339,20 @@ def confirm_hold(
 def cancel_booking(
     session: Session,
     booking_id: int,
+    member_id: int,  # <-- 1. Function signature mein member_id add kiya
 ) -> CourtReservation:
     """Cancel a confirmed reservation and calculate refund eligibility."""
 
     now = datetime.now(timezone.utc)
 
     with session.begin():
+        # <-- 2. Purani query ko is nayi query se replace kiya
         reservation = session.scalar(
             select(CourtReservation)
-            .where(CourtReservation.id == booking_id)
+            .where(
+                CourtReservation.id == booking_id,
+                CourtReservation.member_id == member_id,
+            )
             .with_for_update()
         )
 

@@ -3,9 +3,23 @@ from datetime import date, datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=5, max_length=255)
+    full_name: str = Field(min_length=2, max_length=150)
+    password: str = Field(min_length=8, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
 
 class HoldCreateRequest(BaseModel):
-    member_id: int = Field(gt=0)
     court_id: int = Field(gt=0)
     starts_at: datetime
 
@@ -17,7 +31,6 @@ class HoldCreateRequest(BaseModel):
         return value
 
 class RecurringBookingRequest(BaseModel):
-    member_id: int = Field(gt=0)
     court_id: int = Field(gt=0)
     starts_at: datetime
     weeks: int = Field(ge=1, le=12)
