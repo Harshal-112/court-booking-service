@@ -1,0 +1,42 @@
+diff --git a/app/schema.py b/app/schema.py
+index 8136234..ba2fae5 100644
+--- a/app/schema.py
++++ b/app/schema.py
+@@ -1,17 +1,33 @@
+ from decimal import Decimal
+ from datetime import date, datetime
+ 
+-from pydantic import BaseModel, ConfigDict, Field, field_validator
++from pydantic import (
++    BaseModel,
++    ConfigDict,
++    Field,
++    EmailStr,
++    field_validator,
++)
+ 
+ class RegisterRequest(BaseModel):
+-    email: str = Field(min_length=5, max_length=255)
++    email: EmailStr
+     full_name: str = Field(min_length=2, max_length=150)
+     password: str = Field(min_length=8, max_length=128)
+ 
++    @field_validator("full_name")
++    @classmethod
++    def validate_full_name(cls, value: str) -> str:
++        value = value.strip()
++
++        if len(value) < 2:
++            raise ValueError("Full name must contain at least 2 characters.")
++
++        return value
++
+ 
+ class LoginRequest(BaseModel):
+-    email: str
+-    password: str
++    email: EmailStr
++    password: str = Field(min_length=1, max_length=128)
+ 
+ 
+ class TokenResponse(BaseModel):

@@ -55,8 +55,23 @@ def create_access_token(member_id: int, role: str) -> str:
 
 
 def decode_access_token(token: str) -> dict:
-    return jwt.decode(
+    payload = jwt.decode(
         token,
         SECRET_KEY,
         algorithms=[ALGORITHM],
+        options={
+            "require": ["sub", "exp"],
+        },
     )
+
+    subject = payload.get("sub")
+
+    if (
+        not isinstance(subject, str)
+        or not subject.isascii()
+        or not subject.isdigit()
+        or int(subject) <= 0
+    ):
+        raise jwt.InvalidTokenError("Invalid subject claim.")
+
+    return payload

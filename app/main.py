@@ -1,14 +1,19 @@
+from datetime import date, datetime, timedelta, timezone
 
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi.middleware.cors import CORSMiddleware
+from redis.exceptions import RedisError
 from sqlalchemy import select
-from app.models import Member
-from app.auth import get_db, get_current_member, require_staff
-from app.security import hash_password, verify_password, create_access_token
-from sqlalchemy.orm import Session
-from datetime import date
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
+from app.auth import get_db, get_current_member, require_staff
 from app.database import SessionLocal
+from app.models import Member
+from app.rate_limiter import (
+    record_failed_login,
+    reset_account_ip_attempts,
+)
 from app.schema import (
     HoldCreateRequest,
     HoldResponse,
@@ -18,7 +23,12 @@ from app.schema import (
     RegisterRequest,
     LoginRequest,
     TokenResponse,
+    MemberResponse,
+    DashboardStats,
+    BookingSummary,
 )
+
+from app.security import hash_password, verify_password, create_access_token
 from app.services.reservation_service import (
     create_hold,
     MemberNotFoundError,
@@ -35,13 +45,22 @@ from app.services.reservation_service import (
     create_recurring_bookings,
     get_weekly_utilization,
     ReservationError,
+    CourtReservation,
 )
-
+from app.models import Court, CourtReservation as ReservationModel, Venue
 
 app = FastAPI(
     title="Court Booking API",
     description="Backend for a multi-venue sports court booking system.",
     version="0.1.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 @app.post(
@@ -102,34 +121,69 @@ def register(
     }
 
 
+
 @app.post("/auth/login", response_model=TokenResponse)
 def login(
     request: LoginRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
 ):
     email = request.email.strip().lower()
 
-    member = db.scalar(
-        select(Member).where(Member.email == email)
+    ip_address = (
+        http_request.client.host
+        if http_request.client
+        else "unknown"
     )
 
-    if member is None or not verify_password(
-        request.password,
-        member.password_hash,
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid email or password.",
-            headers={"WWW-Authenticate": "Bearer"},
+    try:
+        member = db.scalar(
+            select(Member).where(Member.email == email)
         )
 
-    token = create_access_token(member.id, member.role)
+        password_valid = (
+            member is not None
+            and verify_password(
+                request.password,
+                member.password_hash,
+            )
+        )
 
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-    }
+        if not password_valid:
+            allowed = record_failed_login(email, ip_address)
 
+            if not allowed:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Too many login attempts. Try again after 15 minutes.",
+                )
+
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid email or password.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        reset_account_ip_attempts(email, ip_address)
+
+        token = create_access_token(member.id, member.role)
+
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+        }
+
+    except RedisError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Login service temporarily unavailable.",
+        )
+
+@app.get("/auth/me", response_model=MemberResponse)
+def get_my_profile(
+    current_member: Member = Depends(get_current_member),
+):
+    return current_member
 
 @app.get("/health")
 def health_check() -> dict[str, str]:
@@ -344,3 +398,130 @@ def weekly_venue_utilization(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         )
+
+
+@app.get("/dashboard/stats", response_model=DashboardStats)
+def dashboard_stats(
+    current_member: Member = Depends(get_current_member),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+
+    # Upcoming bookings: confirmed future reservations
+    upcoming_count = db.scalar(
+        select(func.count(ReservationModel.id)).where(
+            ReservationModel.member_id == current_member.id,
+            ReservationModel.status == "confirmed",
+            ReservationModel.starts_at > now,
+        )
+    ) or 0
+
+    # Total bookings: all confirmed + cancelled
+    total_count = db.scalar(
+        select(func.count(ReservationModel.id)).where(
+            ReservationModel.member_id == current_member.id,
+            ReservationModel.status.in_(["confirmed", "cancelled"]),
+        )
+    ) or 0
+
+    # Refunds: cancelled bookings that are refund eligible
+    refunds = db.scalar(
+        select(func.count(ReservationModel.id)).where(
+            ReservationModel.member_id == current_member.id,
+            ReservationModel.status == "cancelled",
+            ReservationModel.refund_eligible == True,
+        )
+    ) or 0
+
+    # Wallet balance: sum of all reservation prices (confirmed + upcoming)
+    wallet = db.scalar(
+        select(func.sum(ReservationModel.price)).where(
+            ReservationModel.member_id == current_member.id,
+            ReservationModel.status.in_(["confirmed", "held"]),
+            ReservationModel.starts_at > now,
+        )
+    ) or 0
+
+    return DashboardStats(
+        upcoming_bookings=upcoming_count,
+        total_bookings=total_count,
+        refunds=refunds,
+        wallet_balance=float(wallet) if wallet else 0.0,
+    )
+
+
+@app.get("/dashboard/bookings", response_model=list[BookingSummary])
+def dashboard_bookings(
+    current_member: Member = Depends(get_current_member),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+
+    bookings = db.scalars(
+        select(ReservationModel).where(
+            ReservationModel.member_id == current_member.id,
+            ReservationModel.status.in_(["confirmed", "cancelled", "held"]),
+        )
+        .order_by(ReservationModel.starts_at.desc())
+    ).all()
+
+    # Enrich with court and venue info
+    result = []
+    for booking in bookings:
+        court = db.scalar(select(Court).where(Court.id == booking.court_id))
+        venue = db.scalar(select(Venue).where(Venue.id == court.venue_id)) if court else None
+
+        result.append(BookingSummary(
+            id=booking.id,
+            court_id=booking.court_id,
+            court_name=court.name if court else "Unknown Court",
+            venue_name=venue.name if venue else "Unknown Venue",
+            sport_type=court.sport_type if court else "Unknown",
+            starts_at=booking.starts_at,
+            ends_at=booking.ends_at,
+            price=booking.price,
+            status=booking.status,
+            refund_eligible=booking.refund_eligible,
+            cancelled_at=booking.cancelled_at,
+        ))
+
+    return result
+
+
+@app.get("/dashboard/bookings/upcoming", response_model=list[BookingSummary])
+def dashboard_upcoming_bookings(
+    current_member: Member = Depends(get_current_member),
+    db: Session = Depends(get_db),
+):
+    now = datetime.now(timezone.utc)
+
+    bookings = db.scalars(
+        select(ReservationModel).where(
+            ReservationModel.member_id == current_member.id,
+            ReservationModel.status == "confirmed",
+            ReservationModel.starts_at > now,
+        )
+        .order_by(ReservationModel.starts_at.asc())
+    ).all()
+
+    # Enrich with court and venue info
+    result = []
+    for booking in bookings:
+        court = db.scalar(select(Court).where(Court.id == booking.court_id))
+        venue = db.scalar(select(Venue).where(Venue.id == court.venue_id)) if court else None
+
+        result.append(BookingSummary(
+            id=booking.id,
+            court_id=booking.court_id,
+            court_name=court.name if court else "Unknown Court",
+            venue_name=venue.name if venue else "Unknown Venue",
+            sport_type=court.sport_type if court else "Unknown",
+            starts_at=booking.starts_at,
+            ends_at=booking.ends_at,
+            price=booking.price,
+            status=booking.status,
+            refund_eligible=booking.refund_eligible,
+            cancelled_at=booking.cancelled_at,
+        ))
+
+    return result

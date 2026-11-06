@@ -1,16 +1,27 @@
-
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
+from unittest.mock import patch
 
+import jwt
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from redis.exceptions import ConnectionError as RedisConnectionError
+from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
 from app.models import Member, Venue, Court
-from app.security import create_access_token, decode_access_token
+from app.security import (
+    create_access_token,
+    decode_access_token,
+    SECRET_KEY,
+    ALGORITHM,
+)
 from app.services.reservation_service import create_hold, confirm_hold
-from fastapi import HTTPException
-from sqlalchemy.exc import IntegrityError
-
+from app.rate_limiter import (
+    record_failed_login,
+    reset_account_ip_attempts,
+)
 from app.main import app, register
 from app.schema import RegisterRequest
 
@@ -697,6 +708,57 @@ def test_login_api_success():
     payload = decode_access_token(data["access_token"])
     assert payload["role"] == "member"
 
+def test_get_my_profile_success():
+    client = TestClient(app)
+    email = f"profile_{uuid4().hex[:8]}@example.com"
+    full_name = "Profile Test Member"
+
+    register_response = client.post(
+        "/auth/register",
+        json={
+            "email": email,
+            "full_name": full_name,
+            "password": "StrongPass123",
+        },
+    )
+
+    assert register_response.status_code == 201
+
+    token = register_response.json()["access_token"]
+
+    response = client.get(
+        "/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+
+    data = response.json()
+    assert data["email"] == email
+    assert data["full_name"] == full_name
+    assert data["role"] == "member"
+    assert isinstance(data["id"], int)
+
+    assert "password_hash" not in data
+
+
+def test_get_my_profile_rejects_missing_token():
+    client = TestClient(app)
+
+    response = client.get("/auth/me")
+
+    assert response.status_code == 401
+
+
+def test_get_my_profile_rejects_invalid_token():
+    client = TestClient(app)
+
+    response = client.get(
+        "/auth/me",
+        headers={"Authorization": "Bearer invalid.token.value"},
+    )
+
+    assert response.status_code == 401
 
 def test_login_api_rejects_invalid_password():
     client = TestClient(app)
@@ -723,6 +785,63 @@ def test_login_api_rejects_invalid_password():
 
     assert response.status_code == 401
     assert response.json()["detail"] == "Invalid email or password."
+
+def test_register_rejects_invalid_email():
+    client = TestClient(app)
+
+    response = client.post(
+        "/auth/register",
+        json={
+            "email": "invalid-email",
+            "full_name": "Test Member",
+            "password": "StrongPass123",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_register_rejects_whitespace_only_name():
+    client = TestClient(app)
+
+    response = client.post(
+        "/auth/register",
+        json={
+            "email": "whitespace@example.com",
+            "full_name": "   ",
+            "password": "StrongPass123",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_login_rejects_invalid_email():
+    client = TestClient(app)
+
+    response = client.post(
+        "/auth/login",
+        json={
+            "email": "invalid-email",
+            "password": "StrongPass123",
+        },
+    )
+
+    assert response.status_code == 422
+
+
+def test_login_rejects_empty_password():
+    client = TestClient(app)
+
+    response = client.post(
+        "/auth/login",
+        json={
+            "email": "test@example.com",
+            "password": "",
+        },
+    )
+
+    assert response.status_code == 422
 
 def test_register_handles_database_duplicate_conflict():
     existing_member = Member(
@@ -775,3 +894,195 @@ def test_register_handles_database_duplicate_conflict():
 
     assert fake_db.rolled_back is True
     assert fake_db.scalar_calls == 2
+
+def test_decode_access_token_rejects_expired_token():
+    token = jwt.encode(
+        {
+            "sub": "1",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+
+def test_decode_access_token_rejects_missing_subject():
+    token = jwt.encode(
+        {
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+
+def test_decode_access_token_rejects_missing_expiration():
+    token = jwt.encode(
+        {
+            "sub": "1",
+            "role": "member",
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+
+def test_decode_access_token_rejects_invalid_subject():
+    token = jwt.encode(
+        {
+            "sub": "-1",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+def test_decode_access_token_rejects_invalid_signature():
+    token = jwt.encode(
+        {
+            "sub": "1",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+        },
+        "different-secret-key-that-is-not-correct",
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+
+def test_decode_access_token_rejects_unsupported_algorithm():
+    token = jwt.encode(
+        {
+            "sub": "1",
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+        },
+        SECRET_KEY,
+        algorithm="HS384",
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+
+@pytest.mark.parametrize("subject", ["abc", "0", "-1", "１２３"])
+def test_decode_access_token_rejects_invalid_subject_formats(subject):
+    token = jwt.encode(
+        {
+            "sub": subject,
+            "role": "member",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=30),
+        },
+        SECRET_KEY,
+        algorithm=ALGORITHM,
+    )
+
+    with pytest.raises(jwt.InvalidTokenError):
+        decode_access_token(token)
+
+def test_login_rate_limit_blocks_sixth_failed_attempt():
+    client = TestClient(app)
+    email = f"limit_{uuid4().hex[:8]}@example.com"
+
+    for attempt in range(5):
+        response = client.post(
+            "/auth/login",
+            json={
+                "email": email,
+                "password": "WrongPassword123",
+            },
+        )
+        assert response.status_code == 401
+
+    response = client.post(
+        "/auth/login",
+        json={
+            "email": email,
+            "password": "WrongPassword123",
+        },
+    )
+
+    assert response.status_code == 429
+
+
+def test_successful_login_resets_account_ip_counter():
+    client = TestClient(app)
+    email = f"reset_{uuid4().hex[:8]}@example.com"
+    ip_address = "testclient"
+
+    register_response = client.post(
+        "/auth/register",
+        json={
+            "email": email,
+            "full_name": "Rate Limit Test",
+            "password": "StrongPass123",
+        },
+    )
+    assert register_response.status_code == 201
+
+    for _ in range(4):
+        assert record_failed_login(email, ip_address) is True
+
+    response = client.post(
+        "/auth/login",
+        json={
+            "email": email,
+            "password": "StrongPass123",
+        },
+    )
+
+    assert response.status_code == 200
+
+    assert record_failed_login(email, ip_address) is True
+
+def test_login_rate_limit_blocks_multiple_emails_from_same_ip():
+    ip_address = "testclient"
+
+    for index in range(20):
+        email = f"ip_limit_{index}@example.com"
+
+        assert record_failed_login(email, ip_address) is True
+
+    response = record_failed_login(
+        "another_account@example.com",
+        ip_address,
+    )
+
+    assert response is False
+
+def test_login_returns_503_when_redis_is_unavailable():
+    client = TestClient(app)
+
+    with patch(
+        "app.main.record_failed_login",
+        side_effect=RedisConnectionError("Redis unavailable"),
+    ):
+        response = client.post(
+            "/auth/login",
+            json={
+                "email": "unknown@example.com",
+                "password": "WrongPassword123",
+            },
+        )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == (
+        "Login service temporarily unavailable."
+    )

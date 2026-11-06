@@ -4,7 +4,7 @@ import os
 import pytest
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
-
+from app.rate_limiter import redis_client
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
@@ -39,6 +39,19 @@ def clean_test_database():
                     RESTART IDENTITY CASCADE
                 """)
             )
+
+    clean()
+    yield
+    clean()
+
+@pytest.fixture(autouse=True)
+def clean_test_redis():
+    pattern = "court_booking:login:*"
+
+    def clean():
+        keys = list(redis_client.scan_iter(match=pattern))
+        if keys:
+            redis_client.delete(*keys)
 
     clean()
     yield
